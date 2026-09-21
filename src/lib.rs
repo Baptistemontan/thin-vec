@@ -174,9 +174,7 @@ use malloc_size_of::{MallocShallowSizeOf, MallocSizeOf, MallocSizeOfOps};
 #[cfg(not(feature = "gecko-ffi"))]
 mod impl_details {
     pub type SizeType = usize;
-    // for ZSTs, store the length in the the NonNull<T> as a NonZero<usize>,
-    // the length is thus off by one and can only reach usize::MAX - 1
-    pub const MAX_CAP: usize = usize::MAX - 1;
+    pub const MAX_CAP: usize = usize::MAX;
 
     #[inline(always)]
     pub fn assert_size(x: usize) -> SizeType {
@@ -549,7 +547,7 @@ impl<T> ThinVec<T> {
         if Self::is_zst() {
             unsafe {
                 ThinVec {
-                    ptr: len_to_ptr_unchecked(1),
+                    ptr: len_to_ptr_unchecked(align_of::<T>()),
                     boo: PhantomData,
                 }
             }
@@ -631,7 +629,7 @@ impl<T> ThinVec<T> {
         if Self::is_zst() {
             unsafe {
                 return ThinVec {
-                    ptr: len_to_ptr_unchecked(1),
+                    ptr: len_to_ptr_unchecked(align_of::<T>()),
                     boo: PhantomData,
                 };
             }
@@ -666,7 +664,7 @@ impl<T> ThinVec<T> {
 
     fn data_raw(&self) -> *mut T {
         if Self::is_zst() {
-            return ptr::dangling_mut();
+            return self.ptr.cast().as_ptr();
         }
 
         // `padding` contains ~static assertions against types that are
@@ -701,7 +699,7 @@ impl<T> ThinVec<T> {
 
         unsafe {
             if !empty_header_is_aligned && self.header().cap() == 0 {
-                ptr::dangling_mut()
+                ptr::without_provenance_mut(align_of::<T>())
             } else {
                 // This could technically result in overflow, but padding
                 // would have to be absurdly large for this to occur.
@@ -712,26 +710,40 @@ impl<T> ThinVec<T> {
         }
     }
 
-    /// Decomposes a `ThinVec<T>` into its raw components: `(pointer, length, capacity)`.
-    ///
-    /// Returns the raw pointer to the underlying data, the length of
-    /// the vector (in elements), and it's capacity (also in elements).
+    /// Consumme the `ThinVec` and returns the raw pointer to the underlying data
     ///
     /// After calling this function, the caller is responsible for the
     /// memory previously managed by the `ThinVec`. one does this by converting the raw pointer and length back
-    /// into a `ThinVec` with the [`from_parts`] function, since the given pointer is offsetted from the actual allocation pointer.
+    /// into a `ThinVec` with the [`from_raw`] function, since the given pointer is offsetted from the actual allocation pointer.
     ///
-    /// [`from_parts`]: ThinVec::from_parts
+    /// # Examples
+    ///
+    /// ```
+    /// use thin_vec::ThinVec;
+    ///
+    /// let v: ThinVec<i32> = thin_vec::thin_vec![-1, 0, 1];
+    ///
+    /// let ptr = v.into_raw();
+    ///
+    /// let rebuilt = unsafe {
+    ///     // We can now make changes to the components, such as
+    ///     // transmuting the raw pointer to a compatible type.
+    ///     let ptr = ptr.cast::<u32>();
+    ///
+    ///     ThinVec::from_raw(ptr)
+    /// };
+    /// assert_eq!(rebuilt, [4294967295, 0, 1]);
+    /// ```
+    ///
+    /// [`from_raw`]: ThinVec::from_raw
     #[must_use = "losing the pointer will leak memory"]
-    pub fn into_parts(self) -> (NonNull<T>, usize, usize) {
+    pub fn into_raw(self) -> NonNull<T> {
         let data_ptr = unsafe { NonNull::new_unchecked(self.data_raw()) };
-        let len = self.len();
-        let cap = self.capacity();
         mem::forget(self);
-        (data_ptr, len, cap)
+        data_ptr
     }
 
-    /// Creates a `ThinVec<T>` directly from a pointer, a length, and a capacity.
+    /// Creates a `ThinVec<T>` directly from a pointer.
     ///
     /// # Safety
     ///
@@ -739,14 +751,11 @@ impl<T> ThinVec<T> {
     /// checked:
     ///
     /// * The raw pointer must have been previously returned by a call to
-    ///   [`ThinVec<U>::into_parts`], it is undefined behavior if not.
+    ///   [`ThinVec<U>::into_raw`], it is undefined behavior if not.
     /// * `U` must have the same layout as `T`. This is trivially true if `U` is `T`.
     /// * Note that if `U` is not `T` but has the same size
     ///   and alignment, this is basically like transmuting different types. See [`mem::transmute`] for more information
     ///   on what restrictions apply in this case.
-    /// * `length` needs to be less than or equal to `capacity`.
-    /// * The first `length` values must be properly initialized values of type `T`.
-    /// * `capacity` needs to be the exact same capacity that the pointer was acquired with.
     ///
     /// The ownership of `ptr` is effectively transferred to the
     /// `ThinVec<T>` which may then deallocate, reallocate or change the
@@ -754,25 +763,55 @@ impl<T> ThinVec<T> {
     /// that nothing else uses the pointer after calling this
     /// function.
     ///
-    /// [`ThinVec<U>::into_parts`]: ThinVec::into_parts
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ptr;
+    /// use thin_vec::ThinVec;
+    ///
+    /// let v = thin_vec::thin_vec![1, 2, 3];
+    ///
+    /// // Deconstruct the vector into parts.
+    /// let len = v.len();
+    /// let p = v.into_raw();
+    ///
+    /// unsafe {
+    ///     // Overwrite memory with 4, 5, 6
+    ///     for i in 0..len {
+    ///         p.add(i).write(4 + i);
+    ///     }
+    ///
+    ///     // Put everything back together into a ThinVec
+    ///     let rebuilt = ThinVec::from_raw(p);
+    ///     assert_eq!(rebuilt, [4, 5, 6]);
+    /// }
+    /// ```
+    ///
+    /// [`ThinVec<U>::into_raw`]: ThinVec::into_raw
     /// [`mem::transmute`]: core::mem::transmute
-    pub unsafe fn from_parts(ptr: NonNull<T>, len: usize, capacity: usize) -> Self {
+    pub unsafe fn from_raw(ptr: NonNull<T>) -> Self {
         // `padding` contains ~static assertions against types that are
         // incompatible with the current feature flags. We also call it to
         // invoke these assertions when creating a `ThinVec`, even if we don't need the result.
         let padding = padding::<T>();
 
         if Self::is_zst() {
-            return unsafe {
-                ThinVec {
-                    ptr: len_to_ptr_unchecked(len + 1),
-                    boo: PhantomData,
-                }
+            return ThinVec {
+                ptr: ptr.cast(),
+                boo: PhantomData,
             };
         }
 
+        // See `data_raw`, it mirrors the math
+
+        let empty_header_is_aligned = if cfg!(feature = "gecko-ffi") {
+            true
+        } else {
+            mem::align_of::<Header>() >= mem::align_of::<T>() && padding == 0
+        };
+
         unsafe {
-            if capacity == 0 {
+            if !empty_header_is_aligned && ptr.addr().get() == align_of::<T>() {
                 Self::new()
             } else {
                 let header_size = mem::size_of::<Header>();
@@ -807,7 +846,8 @@ impl<T> ThinVec<T> {
     /// ```
     pub fn len(&self) -> usize {
         if Self::is_zst() {
-            (self.ptr.as_ptr() as usize) - 1
+            let as_int = self.ptr.as_ptr() as usize;
+            (as_int / align_of::<T>()) - 1
         } else {
             unsafe { self.header().len() }
         }
@@ -843,7 +883,7 @@ impl<T> ThinVec<T> {
     /// ```
     pub fn capacity(&self) -> usize {
         if Self::is_zst() {
-            MAX_CAP
+            (MAX_CAP / align_of::<T>()) - 1
         } else {
             unsafe { self.header().cap() }
         }
@@ -948,15 +988,17 @@ impl<T> ThinVec<T> {
     /// For internal use only, when setting the length and it's known that T is a ZST.
     /// # Safety
     /// - This is unsafe when T is not a ZST.
-    /// - len must be < usize::MAX
+    /// - len must be < usize::MAX / align_of::<T>
     #[inline]
     unsafe fn set_len_zst(&mut self, len: usize) {
         debug_assert!(Self::is_zst());
         debug_assert!(
-            len <= MAX_CAP,
-            "invalid set_len(usize::MAX) on ZST ThinVec (max cap is usize::MAX - 1)"
+            len < usize::MAX / align_of::<T>(),
+            "invalid set_len({}) on ZST ThinVec, max capacity is {}",
+            len,
+            (usize::MAX / align_of::<T>()) - 1
         );
-        unsafe { self.ptr = len_to_ptr_unchecked(len + 1) }
+        unsafe { self.ptr = len_to_ptr_unchecked((len + 1) * align_of::<T>()) }
     }
 
     /// For internal use only, when setting the length and it's known that the header is owned.
@@ -1299,7 +1341,7 @@ impl<T> ThinVec<T> {
         if min_cap <= old_cap {
             return;
         }
-        // only way to get here is if min_cap == usize::MAX, which we can't handle.
+        // ZSTs are already at max cap
         if Self::is_zst() {
             capacity_overflow();
         }
@@ -1382,7 +1424,7 @@ impl<T> ThinVec<T> {
         let new_cap = self.len().checked_add(additional).unwrap_cap_overflow();
         let old_cap = self.capacity();
         if new_cap > old_cap {
-            // only way to get here is if new_cap == usize::MAX, which we can't handle.
+            // ZSTs are already at max cap
             if Self::is_zst() {
                 capacity_overflow()
             }
@@ -4302,19 +4344,31 @@ mod std_tests {
     #[test]
     #[cfg(not(feature = "gecko-ffi"))]
     fn test_drain_max_vec_size() {
-        let mut v = ThinVec::<()>::with_capacity(MAX_CAP);
+        let mut v = ThinVec::<()>::new();
+        let cap = v.capacity();
         unsafe {
-            v.set_len(MAX_CAP);
+            v.set_len(cap);
         }
-        for _ in v.drain(MAX_CAP - 1..) {}
-        assert_eq!(v.len(), MAX_CAP - 1);
+        for _ in v.drain(cap - 1..) {}
+        assert_eq!(v.len(), cap - 1);
 
-        let mut v = ThinVec::<()>::with_capacity(MAX_CAP);
+        let mut v = ThinVec::<()>::with_capacity(cap);
         unsafe {
-            v.set_len(MAX_CAP);
+            v.set_len(cap);
         }
-        for _ in v.drain(MAX_CAP - 1..=MAX_CAP - 1) {}
-        assert_eq!(v.len(), MAX_CAP - 1);
+        for _ in v.drain(cap - 1..=cap - 1) {}
+        assert_eq!(v.len(), cap - 1);
+    }
+
+    #[test]
+    #[should_panic = "capacity overflow"]
+    fn test_zst_cap_overflow() {
+        let mut v = ThinVec::<()>::new();
+        let cap = v.capacity();
+        unsafe {
+            v.set_len(cap);
+        }
+        v.push(());
     }
 
     #[test]
