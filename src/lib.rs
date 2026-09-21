@@ -4372,7 +4372,11 @@ mod std_tests {
     }
 
     #[test]
-    #[should_panic = "capacity overflow"]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
+    #[cfg_attr(not(feature = "gecko-ffi"), should_panic = "capacity overflow")]
     fn test_zst_cap_overflow() {
         let mut v = ThinVec::<()>::new();
         let cap = v.capacity();
