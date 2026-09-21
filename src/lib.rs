@@ -268,6 +268,7 @@ mod impl_details {
     }
 
     #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
     pub fn assert_size(x: usize) -> SizeType {
         if x > MAX_CAP as usize {
             panic!("nsTArray size may not exceed the capacity of a 32-bit sized int");
@@ -333,6 +334,7 @@ impl Header {
     }
 
     #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
     fn set_len(&mut self, len: usize) {
         self._len = assert_size(len);
     }
@@ -481,6 +483,10 @@ const unsafe fn len_to_ptr_unchecked<T: Sized>(len: usize) -> NonNull<T> {
     debug_assert!(len != 0);
     // NonNull::without_provenance polyfill
     unsafe { mem::transmute(NonZeroUsize::new_unchecked(len)) }
+}
+
+const fn zst_max_cap<T>() -> usize {
+    (usize::MAX / align_of::<T>()) - align_of::<T>()
 }
 
 /// See the crate's top level documentation for a description of this type.
@@ -883,7 +889,7 @@ impl<T> ThinVec<T> {
     /// ```
     pub fn capacity(&self) -> usize {
         if Self::is_zst() {
-            (MAX_CAP / align_of::<T>()) - 1
+            zst_max_cap::<T>()
         } else {
             unsafe { self.header().cap() }
         }
@@ -975,6 +981,7 @@ impl<T> ThinVec<T> {
     ///
     /// Normally, here, one would use [`clear`] instead to correctly drop
     /// the contents and thus not leak memory.
+    #[cfg_attr(debug_assertions, track_caller)]
     pub unsafe fn set_len(&mut self, len: usize) {
         if self.is_singleton() {
             // A prerequisite of `Vec::set_len` is that `new_len` must be
@@ -987,32 +994,35 @@ impl<T> ThinVec<T> {
 
     /// For internal use only, when setting the length and it's known that T is a ZST.
     /// # Safety
-    /// - This is unsafe when T is not a ZST.
-    /// - len must be < usize::MAX / align_of::<T>
+    /// - This is UB when T is not a ZST.
+    /// - len must be <= zst_max_cap::<T>()
     #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
     unsafe fn set_len_zst(&mut self, len: usize) {
         debug_assert!(Self::is_zst());
         debug_assert!(
-            len < usize::MAX / align_of::<T>(),
+            len <= zst_max_cap::<T>(),
             "invalid set_len({}) on ZST ThinVec, max capacity is {}",
             len,
-            (usize::MAX / align_of::<T>()) - 1
+            zst_max_cap::<T>()
         );
         unsafe { self.ptr = len_to_ptr_unchecked((len + 1) * align_of::<T>()) }
     }
 
     /// For internal use only, when setting the length and it's known that the header is owned.
     /// # Safety
-    /// This is unsafe when the header is EMPTY_HEADER or when T is a ZST.
+    /// This is UB when the header is EMPTY_HEADER or when T is a ZST.
     #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
     unsafe fn set_header_len(&mut self, len: usize) {
         unsafe { self.header_mut().set_len(len) }
     }
 
     /// For internal use only, when setting the length and it's known to be the non-singleton or T is a ZST.
     /// # Safety
-    /// This is unsafe when the header is EMPTY_HEADER.
+    /// This is UB when the header is EMPTY_HEADER.
     #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
     unsafe fn set_len_non_singleton(&mut self, len: usize) {
         debug_assert!(!self.is_singleton());
         if Self::is_zst() {
@@ -3331,7 +3341,7 @@ impl std::io::Write for ThinVec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CAP, ThinVec};
+    use super::ThinVec;
     use crate::alloc::{string::ToString, vec};
 
     #[test]
@@ -3480,12 +3490,13 @@ mod tests {
         should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
     )]
     fn test_drain_max_vec_size() {
-        let mut v = ThinVec::<()>::with_capacity(MAX_CAP);
+        let zst_max_cap = usize::MAX - 1;
+        let mut v = ThinVec::<()>::with_capacity(zst_max_cap);
         unsafe {
-            v.set_len(MAX_CAP);
+            v.set_len(zst_max_cap);
         }
-        for _ in v.drain(MAX_CAP - 1..) {}
-        assert_eq!(v.len(), MAX_CAP - 1);
+        for _ in v.drain(zst_max_cap - 1..) {}
+        assert_eq!(v.len(), zst_max_cap - 1);
     }
 
     #[test]
